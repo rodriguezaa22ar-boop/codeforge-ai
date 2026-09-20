@@ -29,6 +29,7 @@ from cyber_agent.contracts import (
     TransportKind,
     TransportSpec,
 )
+from cyber_agent.controller import Controller
 from cyber_agent.policy import PolicyDenied, PolicyValidator
 
 
@@ -277,7 +278,11 @@ class CodeForgeAIAdapter:
 
 
 class JsonlServer:
-    """Translate JSONL requests into validated, read-only capability results."""
+    """Translate JSONL requests into validated, read-only capability results.
+
+    Uses the Controller state machine for validation, policy enforcement,
+    dispatch, and result recording.
+    """
 
     def __init__(
         self,
@@ -288,6 +293,20 @@ class JsonlServer:
         self.adapter = adapter
         self.policy = policy or adapter.policy
         self.runtime = runtime or RuntimeConfig()
+        self._controller = self._build_controller()
+
+    def _build_controller(self) -> Controller:
+        """Build a Controller wired to this adapter."""
+
+        class _AdapterController(Controller):
+            def __init__(self, adapter, registry, policy, timeout_seconds):
+                super().__init__(registry, policy, timeout_seconds)
+                self._adapter = adapter
+
+            def _dispatch(self, contract: CapabilityContract, inputs: Mapping[str, Any]) -> dict[str, Any]:
+                return self._adapter.dispatch(contract.id, inputs)
+
+        return _AdapterController(self.adapter, self.adapter.registry, self.policy, self.runtime.request_deadline_seconds)
 
     def process_line(self, line: str) -> str | None:
         if not line.strip():
@@ -318,16 +337,8 @@ class JsonlServer:
                 approval_id=payload.get("approval_id"),
                 authorization_id=payload.get("authorization_id"),
             )
-            contract = self.adapter.registry.get(invocation.capability_id)
-            invocation.validate_against(contract)
-            self.policy.enforce(contract, invocation)
-            outputs = self.adapter.dispatch(invocation.capability_id, invocation.inputs)
-            result = CapabilityResult(
-                request_id=invocation.request_id,
-                status=CapabilityStatus.COMPLETED,
-                outputs=outputs,
-                provenance=Provenance("codeforgeai", "local", _now()),
-            )
+            result = self._controller.run(invocation)
+            result = self._controller.enrich_result(result)
         except PolicyDenied as exc:
             result = CapabilityResult(
                 request_id=str(request_id or "unknown"),

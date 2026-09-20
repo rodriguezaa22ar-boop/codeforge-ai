@@ -89,12 +89,13 @@ def _string_list(value: Any, label: str) -> tuple[str, ...]:
 def _patterns(value: Any, label: str) -> tuple[str, ...]:
     patterns = _string_list(value, label)
     for pattern in patterns:
-        if len(pattern) > 128 or not any(char.isalnum() for char in pattern):
-            raise ConfigError(f"{label} contains an invalid capability pattern: {pattern!r}")
-        # Validate the pattern against the same grammar used for capability IDs
-        # after removing glob characters. This keeps matching predictable.
+        if len(pattern) > 128:
+            raise ConfigError(f"{label} contains an overly long pattern: {pattern!r}")
+        # Strip glob wildcards, then validate the remainder against the
+        # capability-ID grammar. A pattern that is all wildcards is fine
+        # (it matches everything or is purely structural).
         candidate = pattern.replace("*", "x").replace("?", "x")
-        if not _IDENTIFIER.fullmatch(candidate):
+        if candidate and not _IDENTIFIER.fullmatch(candidate):
             raise ConfigError(f"{label} contains an invalid capability pattern: {pattern!r}")
     return patterns
 
