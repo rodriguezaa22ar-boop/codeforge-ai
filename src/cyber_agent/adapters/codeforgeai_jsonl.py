@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -156,6 +157,69 @@ def default_contracts() -> tuple[CapabilityContract, ...]:
             {"type": "object", "required": ["markdown"]},
             "report_render",
         ),
+        _contract(
+            "repository.security_review",
+            "Scan a local git repository for security issues and produce a structured review",
+            {
+                "type": "object",
+                "required": ["repository_path"],
+                "properties": {
+                    "repository_path": {"type": "string", "minLength": 1},
+                    "scan_depth": {"type": "integer", "minimum": 1, "maximum": 10, "default": 3},
+                    "include_dependencies": {"type": "boolean", "default": True},
+                    "include_secrets": {"type": "boolean", "default": True},
+                    "include_git_config": {"type": "boolean", "default": True},
+                },
+            },
+            {
+                "type": "object",
+                "required": ["repository", "findings", "summary", "timestamp"],
+                "properties": {
+                    "repository": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "is_git": {"type": "boolean"},
+                            "branch": {"type": "string"},
+                            "commit": {"type": "string"},
+                            "commit_message": {"type": "string"},
+                        },
+                    },
+                    "findings": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "category": {"type": "string"},
+                                "severity": {"type": "string", "enum": ["info", "low", "medium", "high", "critical"]},
+                                "file": {"type": "string"},
+                                "description": {"type": "string"},
+                                "recommendation": {"type": "string"},
+                            },
+                        },
+                    },
+                    "summary": {
+                        "type": "object",
+                        "properties": {
+                            "total_issues": {"type": "integer"},
+                            "by_severity": {
+                                "type": "object",
+                                "properties": {
+                                    "critical": {"type": "integer"},
+                                    "high": {"type": "integer"},
+                                    "medium": {"type": "integer"},
+                                    "low": {"type": "integer"},
+                                    "info": {"type": "integer"},
+                                },
+                            },
+                            "categories_checked": {"type": "array", "items": {"type": "string"}},
+                        },
+                    },
+                    "timestamp": {"type": "string"},
+                },
+            },
+            "repository_security_review",
+        ),
     )
 
 
@@ -275,6 +339,232 @@ class CodeForgeAIAdapter:
         # Load once here so a malformed file returns a controlled adapter error.
         findings.load_findings(path)
         return {"markdown": skill.clean(report.render_report(engagement))}
+
+    def repository_security_review(self, inputs: Mapping[str, Any]) -> dict[str, Any]:
+        """Scan a local git repository for security issues and produce a structured review.
+
+        This is a read-only, local-only scan that checks:
+        - Git configuration (branch protection, signing, etc.)
+        - Dependency manifests for known-risk patterns
+        - Secrets patterns in tracked files
+        - Repository metadata and configuration
+        """
+        repo_path = Path(inputs["repository_path"]).expanduser().resolve()
+        scan_depth = int(inputs.get("scan_depth", 3))
+        include_deps = inputs.get("include_dependencies", True)
+        include_secrets = inputs.get("include_secrets", True)
+        include_git_config = inputs.get("include_git_config", True)
+
+        if not repo_path.is_dir():
+            raise AdapterError(f"repository path does not exist: {repo_path}")
+
+        findings_list: list[dict[str, Any]] = []
+        repo_info: dict[str, Any] = {"path": str(repo_path), "is_git": False}
+
+        # Check if it's a git repository
+        git_dir = repo_path / ".git"
+        if git_dir.is_dir():
+            repo_info["is_git"] = True
+            if include_git_config:
+                git_findings = self._scan_git_config(repo_path, scan_depth)
+                findings_list.extend(git_findings)
+
+        # Scan for secrets patterns
+        if include_secrets:
+            secret_findings = self._scan_for_secrets(repo_path, scan_depth)
+            findings_list.extend(secret_findings)
+
+        # Scan dependency manifests
+        if include_deps:
+            dep_findings = self._scan_dependencies(repo_path, scan_depth)
+            findings_list.extend(dep_findings)
+
+        # Compute summary
+        severity_counts: dict[str, int] = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
+        categories: set[str] = set()
+        for f in findings_list:
+            sev = f.get("severity", "info")
+            if sev in severity_counts:
+                severity_counts[sev] += 1
+            categories.add(f.get("category", "general"))
+
+        return {
+            "repository": repo_info,
+            "findings": findings_list,
+            "summary": {
+                "total_issues": len(findings_list),
+                "by_severity": severity_counts,
+                "categories_checked": sorted(categories),
+            },
+            "timestamp": _now(),
+        }
+
+    def _scan_git_config(self, repo_path: Path, scan_depth: int) -> list[dict[str, Any]]:
+        """Scan git configuration for security-relevant settings."""
+        findings: list[dict[str, Any]] = []
+        git_dir = repo_path / ".git"
+
+        # Check for branch protection config (if config file exists)
+        config_file = git_dir / "config"
+        if config_file.is_file():
+            try:
+                content = config_file.read_text(encoding="utf-8", errors="replace")
+                # Check for insecure protocol configurations
+                if "[remote" in content:
+                    for line in content.splitlines():
+                        if "url = http://" in line or "url = git://" in line:
+                            findings.append({
+                                "category": "git_config",
+                                "severity": "high",
+                                "file": str(config_file.relative_to(repo_path)),
+                                "description": "Insecure remote URL protocol detected",
+                                "recommendation": "Use SSH or HTTPS URLs for remote repositories",
+                            })
+                            break
+                # Check for credential helper configuration
+                if "credential.helper" in content:
+                    for line in content.splitlines():
+                        if "credential.helper" in line and "store" in line:
+                            findings.append({
+                                "category": "git_config",
+                                "severity": "medium",
+                                "file": str(config_file.relative_to(repo_path)),
+                                "description": "Git credential store enabled - credentials stored in plaintext",
+                                "recommendation": "Consider using credential cache or a credential manager instead of store",
+                            })
+            except OSError:
+                pass
+
+        # Check for GPG signing configuration
+        if config_file.is_file():
+            try:
+                content = config_file.read_text(encoding="utf-8", errors="replace")
+                if "user.signingkey" not in content and "commit.gpgsign" in content:
+                    findings.append({
+                        "category": "git_config",
+                        "severity": "low",
+                        "file": str(config_file.relative_to(repo_path)),
+                        "description": "GPG signing enabled but no signing key configured",
+                        "recommendation": "Configure user.signingkey or disable commit.gpgsign if not needed",
+                    })
+            except OSError:
+                pass
+
+        return findings
+
+    def _scan_for_secrets(self, repo_path: Path, scan_depth: int) -> list[dict[str, Any]]:
+        """Scan repository files for potential secrets and sensitive data."""
+        findings: list[dict[str, Any]] = []
+        secrets_patterns = [
+            (r"AKIA[0-9A-Z]{16}", "AWS Access Key ID"),
+            (r"AIza[0-9A-Za-z\-_]{35}", "Google API Key"),
+            (r"sk-[a-zA-Z0-9]{32,}", "Secret Key Pattern"),
+            (r"-----BEGIN RSA PRIVATE KEY-----", "Private Key"),
+            (r"-----BEGIN PRIVATE KEY-----", "Private Key"),
+            (r"password\s*[:=]\s*\S+", "Password in configuration"),
+            (r"api[_-]?key\s*[:=]\s*\S+", "API Key in configuration"),
+            (r"secret\s*[:=]\s*\S+", "Secret in configuration"),
+            (r"token\s*[:=]\s*\S{20,}", "Token in configuration"),
+        ]
+
+        for dirpath, dirnames, filenames in os.walk(str(repo_path)):
+            dirnames.sort()
+            rel_dir = Path(dirpath).relative_to(repo_path)
+            depth = len(rel_dir.parts) if rel_dir != Path(".") else 0
+            if depth > scan_depth:
+                dirnames.clear()
+                continue
+
+            # Skip .git directory
+            if ".git" in Path(dirpath).parts:
+                continue
+
+            for filename in sorted(filenames):
+                if filename.startswith("."):
+                    continue
+                filepath = Path(dirpath) / filename
+                try:
+                    content = filepath.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+
+                for pattern, description in secrets_patterns:
+                    if pattern in content:
+                        findings.append({
+                            "category": "secrets",
+                            "severity": "high",
+                            "file": str(filepath.relative_to(repo_path)),
+                            "description": f"Potential {description} detected",
+                            "recommendation": "Remove sensitive data from version control. Use environment variables or a secrets manager.",
+                        })
+                        break  # One finding per file
+        return findings
+
+    def _scan_dependencies(self, repo_path: Path, scan_depth: int) -> list[dict[str, Any]]:
+        """Scan dependency manifests for security-relevant patterns."""
+        findings: list[dict[str, Any]] = []
+
+        # Check for common dependency manifest files
+        manifest_files = {
+            "requirements.txt": ["requirements.txt"],
+            "Pipfile": ["Pipfile"],
+            "Pipfile.lock": ["Pipfile.lock"],
+            "setup.py": ["setup.py"],
+            "pyproject.toml": ["pyproject.toml"],
+            "package.json": ["package.json"],
+            "package-lock.json": ["package-lock.json"],
+            "yarn.lock": ["yarn.lock"],
+            "Gemfile": ["Gemfile"],
+            "Gemfile.lock": ["Gemfile.lock"],
+            "composer.json": ["composer.json"],
+            "composer.lock": ["composer.lock"],
+            "Cargo.toml": ["Cargo.toml"],
+            "Cargo.lock": ["Cargo.lock"],
+            "go.mod": ["go.mod"],
+            "go.sum": ["go.sum"],
+            "pom.xml": ["pom.xml"],
+            "build.gradle": ["build.gradle"],
+            "build.gradle.kts": ["build.gradle.kts"],
+        }
+
+        for manifest_name in manifest_files:
+            for dirpath, dirnames, filenames in os.walk(str(repo_path)):
+                dirnames.sort()
+                rel_path = Path(dirpath).relative_to(repo_path)
+                depth = len(rel_path.parts) if rel_path != Path(".") else 0
+                if depth > scan_depth:
+                    dirnames.clear()
+                    continue
+                if manifest_name in filenames:
+                    filepath = Path(dirpath) / manifest_name
+                    findings.append({
+                        "category": "dependencies",
+                        "severity": "info",
+                        "file": str(filepath.relative_to(repo_path)),
+                        "description": f"Dependency manifest found: {manifest_name}",
+                        "recommendation": "Ensure all dependencies are pinned to specific versions and regularly updated. Run 'safety check' or equivalent for known vulnerabilities.",
+                    })
+
+        # Check for .env files (potential secrets)
+        for dirpath, dirnames, filenames in os.walk(str(repo_path)):
+            dirnames.sort()
+            rel_path = Path(dirpath).relative_to(repo_path)
+            depth = len(rel_path.parts) if rel_path != Path(".") else 0
+            if depth > scan_depth:
+                dirnames.clear()
+                continue
+            if ".env" in filenames or ".env.local" in filenames or ".env.production" in filenames:
+                for env_file in [f for f in filenames if f.startswith(".env")]:
+                    filepath = Path(dirpath) / env_file
+                    findings.append({
+                        "category": "secrets",
+                        "severity": "high",
+                        "file": str(filepath.relative_to(repo_path)),
+                        "description": f"Environment file found: {env_file} - may contain secrets",
+                        "recommendation": "Add .env files to .gitignore. Never commit environment files with secrets.",
+                    })
+
+        return findings
 
 
 class JsonlServer:
