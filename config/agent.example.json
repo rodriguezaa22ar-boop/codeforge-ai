@@ -1,0 +1,22 @@
+{
+  "schema_version": "1.0.0",
+  "agent_id": "cyber-agent",
+  "policy": {
+    "max_risk": "read_only",
+    "allowed_transports": ["in_process", "jsonl"],
+    "allowed_capabilities": [
+      "catalog.*",
+      "operator.charter",
+      "findings.*",
+      "report.render"
+    ],
+    "denied_capabilities": ["pipeline.*", "*.run"],
+    "allowed_read_roots": ["../../codeforge-ai"],
+    "allow_shell": false,
+    "max_timeout_seconds": 120
+  },
+  "runtime": {
+    "request_deadline_seconds": 60,
+    "max_input_bytes": 1048576
+  }
+}

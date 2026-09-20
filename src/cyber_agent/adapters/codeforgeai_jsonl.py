@@ -1,0 +1,386 @@
+"""Read-only JSONL adapter for the local CodeForgeAI capability library.
+
+Protocol: one JSON request per stdin line, one JSON result per stdout line.
+The adapter imports CodeForgeAI as a library and exposes only deterministic,
+read-only operations. It never invokes a shell, installs tools, contacts a
+network target, modifies repositories, or writes files.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, Iterable, Mapping
+
+from cyber_agent.config import AgentConfig, ConfigError, ConfigLoader, RuntimeConfig
+from cyber_agent.contracts import (
+    CapabilityContract,
+    CapabilityInvocation,
+    CapabilityRegistry,
+    CapabilityResult,
+    CapabilityStatus,
+    ContractValidationError,
+    EvidenceRef,
+    Provenance,
+    RiskLevel,
+    TransportKind,
+    TransportSpec,
+)
+from cyber_agent.policy import PolicyDenied, PolicyValidator
+
+
+class AdapterError(RuntimeError):
+    """A safe, user-facing adapter failure without a traceback on stdout."""
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _clean(value: Any, cleaner) -> Any:
+    if isinstance(value, str):
+        return cleaner(value)
+    if isinstance(value, list):
+        return [_clean(item, cleaner) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _clean(item, cleaner) for key, item in value.items()}
+    return value
+
+
+def _default_codeforgeai_root() -> Path:
+    return Path(__file__).resolve().parents[4] / "codeforge-ai"
+
+
+def _is_within(path: Path, roots: Iterable[Path]) -> bool:
+    return any(path == root or root in path.parents for root in roots)
+
+
+def _contract(
+    capability_id: str,
+    purpose: str,
+    input_schema: Mapping[str, Any],
+    output_schema: Mapping[str, Any],
+    handler: str,
+) -> CapabilityContract:
+    return CapabilityContract(
+        id=capability_id,
+        version="0.1.0",
+        purpose=purpose,
+        risk=RiskLevel.READ_ONLY,
+        input_schema=input_schema,
+        output_schema=output_schema,
+        transport=TransportSpec(kind=TransportKind.IN_PROCESS),
+        handler=handler,
+    )
+
+
+def default_contracts() -> tuple[CapabilityContract, ...]:
+    """Return the adapter's explicit read-only allowlist."""
+    return (
+        _contract(
+            "catalog.search",
+            "Search CodeForgeAI's approved security-tool catalog",
+            {
+                "type": "object",
+                "required": ["query"],
+                "properties": {
+                    "query": {"type": "string", "minLength": 1},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                },
+            },
+            {"type": "object", "required": ["tools"]},
+            "catalog_search",
+        ),
+        _contract(
+            "catalog.get",
+            "Read one CodeForgeAI catalog entry by title",
+            {
+                "type": "object",
+                "required": ["title"],
+                "properties": {"title": {"type": "string", "minLength": 1}},
+            },
+            {"type": "object", "required": ["tool"]},
+            "catalog_get",
+        ),
+        _contract(
+            "operator.charter",
+            "Read the CodeForgeAI operator safety charter",
+            {"type": "object", "properties": {}},
+            {"type": "object", "required": ["version", "text"]},
+            "operator_charter",
+        ),
+        _contract(
+            "findings.parse",
+            "Parse previously collected tool output into normalized findings",
+            {
+                "type": "object",
+                "required": ["parser", "raw"],
+                "properties": {
+                    "parser": {"type": "string", "enum": ["subfinder", "httpx", "nuclei"]},
+                    "raw": {"type": "string"},
+                    "timestamp": {"type": "string"},
+                },
+            },
+            {"type": "object", "required": ["findings", "forward"]},
+            "findings_parse",
+        ),
+        _contract(
+            "findings.load",
+            "Read normalized findings from an approved local path",
+            {
+                "type": "object",
+                "required": ["path"],
+                "properties": {"path": {"type": "string", "minLength": 1}},
+            },
+            {"type": "object", "required": ["findings"]},
+            "findings_load",
+        ),
+        _contract(
+            "report.render",
+            "Render a deterministic Markdown report from approved findings",
+            {
+                "type": "object",
+                "required": ["findings_path"],
+                "properties": {
+                    "findings_path": {"type": "string", "minLength": 1},
+                    "name": {"type": "string"},
+                    "targets": {"type": "array", "items": {"type": "string"}},
+                    "scope_in": {"type": "array", "items": {"type": "string"}},
+                    "scope_out": {"type": "array", "items": {"type": "string"}},
+                },
+            },
+            {"type": "object", "required": ["markdown"]},
+            "report_render",
+        ),
+    )
+
+
+class CodeForgeAIAdapter:
+    """Lazy-loading, read-only facade over the local CodeForgeAI package."""
+
+    def __init__(
+        self,
+        codeforgeai_root: Path,
+        read_roots: Iterable[Path] = (),
+        policy: PolicyValidator | None = None,
+    ) -> None:
+        self.root = codeforgeai_root.expanduser().resolve()
+        self.src = self.root / "src"
+        if not (self.src / "hackingtool").is_dir():
+            raise AdapterError(f"CodeForgeAI source package not found under {self.src}")
+        self.read_roots = tuple({self.root, *(Path(item).expanduser().resolve() for item in read_roots)})
+        self.registry = CapabilityRegistry(default_contracts())
+        self.policy = policy or PolicyValidator(AgentConfig.default())
+        self._modules: dict[str, Any] = {}
+
+    def _module(self, name: str):
+        if name not in self._modules:
+            import importlib
+
+            if str(self.src) not in sys.path:
+                sys.path.insert(0, str(self.src))
+            self._modules[name] = importlib.import_module(f"hackingtool.{name}")
+        return self._modules[name]
+
+    def _safe_file(self, raw_path: str) -> Path:
+        candidate = Path(raw_path).expanduser().resolve(strict=True)
+        if not candidate.is_file():
+            raise AdapterError("approved path must resolve to a regular file")
+        if not _is_within(candidate, self.read_roots):
+            raise AdapterError("path is outside the adapter's approved read roots")
+        decision = self.policy.validate_path(candidate)
+        if not decision.allowed:
+            raise AdapterError(decision.message)
+        if candidate.stat().st_size > 10 * 1024 * 1024:
+            raise AdapterError("refusing to read files larger than 10 MiB")
+        return candidate
+
+    def dispatch(self, capability_id: str, inputs: Mapping[str, Any]) -> dict[str, Any]:
+        contract = self.registry.get(capability_id)
+        contract.validate_inputs(inputs)
+        return getattr(self, contract.handler)(inputs)
+
+    def catalog_search(self, inputs: Mapping[str, Any]) -> dict[str, Any]:
+        registry = self._module("registry")
+        skill = self._module("skill")
+        query_tokens = set(str(inputs["query"]).lower().split())
+        limit = int(inputs.get("limit", 20))
+        loaded = registry.load(catalog_dir=self.src / "hackingtool" / "catalog")
+        matches: list[tuple[int, dict[str, Any]]] = []
+        for category in loaded.categories:
+            for tool in category.tools:
+                fields = " ".join(
+                    [tool.TITLE, tool.DESCRIPTION, " ".join(tool.TAGS), category.title]
+                ).lower()
+                score = sum(3 if token == tool.TITLE.lower() else 1 for token in query_tokens if token in fields)
+                if score:
+                    matches.append((score, {
+                        "title": skill.clean(tool.TITLE),
+                        "description": skill.clean(tool.DESCRIPTION),
+                        "category": skill.clean(category.title),
+                        "tags": [skill.clean(tag) for tag in tool.TAGS],
+                        "kind": skill.clean(getattr(tool, "KIND", "install")),
+                        "project_url": skill.clean(getattr(tool, "PROJECT_URL", "")),
+                    }))
+        matches.sort(key=lambda item: (-item[0], item[1]["title"].lower()))
+        return {"tools": [item[1] for item in matches[:limit]], "total_matches": len(matches)}
+
+    def catalog_get(self, inputs: Mapping[str, Any]) -> dict[str, Any]:
+        result = self.catalog_search({"query": inputs["title"], "limit": 100})
+        title = str(inputs["title"]).casefold()
+        for tool in result["tools"]:
+            if tool["title"].casefold() == title:
+                return {"tool": tool}
+        raise AdapterError(f"catalog entry not found: {inputs['title']}")
+
+    def operator_charter(self, _inputs: Mapping[str, Any]) -> dict[str, Any]:
+        skill = self._module("skill")
+        return {"version": skill.version(), "text": skill.charter()}
+
+    def findings_parse(self, inputs: Mapping[str, Any]) -> dict[str, Any]:
+        findings = self._module("findings")
+        skill = self._module("skill")
+        parser = findings.PARSERS[inputs["parser"]]
+        parsed, forward = parser(inputs["raw"], inputs.get("timestamp") or _now())
+        return {
+            "findings": [_clean(skill.sanitize(item), skill.clean) for item in parsed],
+            "forward": [_clean(item, skill.clean) for item in forward],
+        }
+
+    def findings_load(self, inputs: Mapping[str, Any]) -> dict[str, Any]:
+        findings = self._module("findings")
+        skill = self._module("skill")
+        path = self._safe_file(inputs["path"])
+        loaded = findings.load_findings(path)
+        return {"findings": [_clean(skill.sanitize(item), skill.clean) for item in loaded]}
+
+    def report_render(self, inputs: Mapping[str, Any]) -> dict[str, Any]:
+        findings = self._module("findings")
+        report = self._module("report")
+        skill = self._module("skill")
+        path = self._safe_file(inputs["findings_path"])
+        # report.render_report only reads these fields and never writes them.
+        engagement = SimpleNamespace(
+            name=str(inputs.get("name", "CodeForgeAI findings")),
+            targets=list(inputs.get("targets", [])),
+            scope_in=list(inputs.get("scope_in", [])),
+            scope_out=list(inputs.get("scope_out", [])),
+            created=_now(),
+            findings_file=path,
+        )
+        # Load once here so a malformed file returns a controlled adapter error.
+        findings.load_findings(path)
+        return {"markdown": skill.clean(report.render_report(engagement))}
+
+
+class JsonlServer:
+    """Translate JSONL requests into validated, read-only capability results."""
+
+    def __init__(
+        self,
+        adapter: CodeForgeAIAdapter,
+        policy: PolicyValidator | None = None,
+        runtime: RuntimeConfig | None = None,
+    ) -> None:
+        self.adapter = adapter
+        self.policy = policy or adapter.policy
+        self.runtime = runtime or RuntimeConfig()
+
+    def process_line(self, line: str) -> str | None:
+        if not line.strip():
+            return None
+        if len(line.encode("utf-8")) > self.runtime.max_input_bytes:
+            return json.dumps(CapabilityResult(
+                request_id="unknown",
+                status=CapabilityStatus.DENIED,
+                error={
+                    "code": "input_too_large",
+                    "message": "request exceeds the configured input size limit",
+                },
+            ).to_dict(), sort_keys=True)
+        request_id = None
+        try:
+            payload = json.loads(line)
+            if not isinstance(payload, Mapping):
+                raise ContractValidationError("request must be a JSON object")
+            request_id = payload.get("request_id")
+            invocation = CapabilityInvocation(
+                request_id=str(request_id or ""),
+                capability_id=payload.get("capability_id", ""),
+                inputs=payload.get("inputs", {}),
+                policy_context=payload.get("policy_context", "default"),
+                deadline_seconds=payload.get(
+                    "deadline_seconds", self.runtime.request_deadline_seconds
+                ),
+                approval_id=payload.get("approval_id"),
+                authorization_id=payload.get("authorization_id"),
+            )
+            contract = self.adapter.registry.get(invocation.capability_id)
+            invocation.validate_against(contract)
+            self.policy.enforce(contract, invocation)
+            outputs = self.adapter.dispatch(invocation.capability_id, invocation.inputs)
+            result = CapabilityResult(
+                request_id=invocation.request_id,
+                status=CapabilityStatus.COMPLETED,
+                outputs=outputs,
+                provenance=Provenance("codeforgeai", "local", _now()),
+            )
+        except PolicyDenied as exc:
+            result = CapabilityResult(
+                request_id=str(request_id or "unknown"),
+                status=CapabilityStatus.DENIED,
+                error={
+                    "code": exc.decision.code,
+                    "message": exc.decision.message,
+                    "reasons": list(exc.decision.reasons),
+                },
+            )
+        except ContractValidationError as exc:
+            result = CapabilityResult(
+                request_id=str(request_id or "unknown"),
+                status=CapabilityStatus.DENIED,
+                error={"code": "invalid_request", "message": str(exc)},
+            )
+        except (AdapterError, KeyError, ValueError, OSError, json.JSONDecodeError) as exc:
+            result = CapabilityResult(
+                request_id=str(request_id or "unknown"),
+                status=CapabilityStatus.FAILED,
+                error={"code": "adapter_error", "message": str(exc)},
+            )
+        return json.dumps(result.to_dict(), sort_keys=True)
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--codeforgeai-root", type=Path, default=None)
+    parser.add_argument("--allow-read-root", action="append", type=Path, default=[])
+    parser.add_argument("--config", type=Path, default=None)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    root = args.codeforgeai_root or Path(
+        __import__("os").environ.get("CODEFORGEAI_ROOT", _default_codeforgeai_root())
+    )
+    try:
+        config = ConfigLoader.load(args.config) if args.config else AgentConfig.default()
+        policy = PolicyValidator(config)
+        read_roots = [*args.allow_read_root, *config.policy.allowed_read_roots]
+        adapter = CodeForgeAIAdapter(root, read_roots, policy=policy)
+        server = JsonlServer(adapter, policy=policy, runtime=config.runtime)
+    except (AdapterError, ConfigError) as exc:
+        print(json.dumps({"status": "failed", "error": {"code": "configuration", "message": str(exc)}}))
+        return 2
+    for line in sys.stdin:
+        response = server.process_line(line)
+        if response is not None:
+            print(response, flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
