@@ -38,6 +38,13 @@ from cyber_agent.adapters.scanner_adapters import (
     RepositorySecurityReview,
     SecretsScanner,
 )
+from cyber_agent.adapters.ai_triage import (
+    TriageNote,
+    TriageResult,
+    TriageVerdict,
+    ai_enrich_triage,
+    deterministic_triage,
+)
 
 
 class AdapterError(RuntimeError):
@@ -309,6 +316,58 @@ def default_contracts() -> tuple[CapabilityContract, ...]:
             risk=RiskLevel.GIT_PUBLISH,
             requires_approval=True,
         ),
+        _contract(
+            "findings.triage",
+            "Triage normalized security findings with deterministic severity-based verdicts and optional AI enrichment",
+            {
+                "type": "object",
+                "required": ["findings"],
+                "properties": {
+                    "findings": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "category": {"type": "string"},
+                                "severity": {"type": "string", "enum": ["info", "low", "medium", "high", "critical"]},
+                                "file": {"type": "string"},
+                                "description": {"type": "string"},
+                                "recommendation": {"type": "string"},
+                            },
+                        },
+                    },
+                    "repository_path": {"type": "string", "minLength": 0},
+                    "ai_provider": {"type": "string", "enum": ["auto", "ollama", "openai-compat"]},
+                },
+            },
+            {
+                "type": "object",
+                "required": ["repository_path", "total_findings", "findings", "triage_notes", "risk_level", "top_priority", "summary"],
+                "properties": {
+                    "repository_path": {"type": "string"},
+                    "total_findings": {"type": "integer"},
+                    "findings": {"type": "array", "items": {"type": "object"}},
+                    "triage_notes": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "finding_index": {"type": "integer"},
+                                "verdict": {"type": "string", "enum": ["ignore", "watch", "review", "action_now"]},
+                                "rationale": {"type": "string"},
+                                "confidence": {"type": "string", "enum": ["high", "medium", "low", "deterministic"]},
+                            },
+                        },
+                    },
+                    "risk_level": {"type": "string", "enum": ["low", "medium", "high", "critical"]},
+                    "top_priority": {"type": "array", "items": {"type": "object"}},
+                    "summary": {"type": "object"},
+                },
+            },
+            "findings_triage",
+            risk=RiskLevel.READ_ONLY,
+        ),
     )
 
 
@@ -479,6 +538,54 @@ class CodeForgeAIAdapter:
             include_secrets=include_secrets,
             include_dependencies=include_deps,
         )
+
+    def findings_triage(self, inputs: Mapping[str, Any]) -> dict[str, Any]:
+        """Triage normalized security findings with deterministic severity-based
+        verdicts and optional AI enrichment via hackingtool's ai_recommend.ask().
+
+        Evidence-first: findings come from deterministic scanners; AI only adds
+        interpretation and may raise (but never lower) the computed risk level.
+        Falls back to purely deterministic triage when no AI provider is reachable.
+        """
+        findings_list = inputs.get("findings", [])
+        if not isinstance(findings_list, list) or not findings_list:
+            raise AdapterError("findings must be a non-empty list")
+
+        repo_path = str(inputs.get("repository_path") or ".")
+        ai_provider = str(inputs.get("ai_provider") or "auto")
+
+        # Run deterministic triage as the baseline
+        result = deterministic_triage(findings_list, repo_path)
+
+        # Optionally enrich with AI when a provider is reachable
+        if ai_provider and ai_provider != "none":
+            try:
+                import hackingtool.ai_recommend as ai_rec
+
+                def _ai_prompt(prompt: str) -> str | None:
+                    if ai_provider == "ollama":
+                        return ai_rec.ask(prompt)
+                    if ai_provider == "openai-compat":
+                        return self._byo_key_prompt(prompt)
+                    # auto: try BYO-key first, then Ollama
+                    r = ai_rec.ask(prompt)
+                    return r
+
+                result = ai_enrich_triage(result, _ai_prompt)
+            except Exception:
+                # Any AI failure is non-fatal — fall back to deterministic
+                pass
+
+        return result.to_dict()
+
+    def _byo_key_prompt(self, prompt: str) -> str | None:
+        """Best-effort BYO-key transport for ai_provider='openai-compat'."""
+        try:
+            import hackingtool.ai_recommend as ai_rec
+
+            return ai_rec._byo_key(prompt)
+        except Exception:
+            return None
 
 
 class JsonlServer:
