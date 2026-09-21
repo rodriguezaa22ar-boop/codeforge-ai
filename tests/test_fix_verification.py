@@ -40,20 +40,23 @@ class FixVerificationTests(unittest.TestCase):
         (self.tmp / "aws_key.txt").unlink()
         (self.tmp / "config.json").write_text('{"setting": "value"}\n')
         (self.tmp / ".env").unlink()
+        # Also fix the GPG signing issue to match the new scanner's coverage
         git_dir = self.tmp / ".git" / "config"
         with git_dir.open("w") as f:
             f.write("[core]\n\trepositoryformatversion = 0\n")
             f.write('[remote "origin"]\n\turl = https://secure.example.com/repo.git\n')
             f.write("[credential]\n\thelper = cache\n")
-            f.write("[commit]\n\tgpgsign = true\n")
+            f.write("[commit]\n\tgpgsign = false\n")
 
     def test_verification_status_partial_when_info_persists(self):
         initial = self.review.review(self.tmp)
         self._apply_fixes()
         verification = self.review.verify_fix(self.tmp, initial["findings"])
         # requirements.txt (info) persists — status is partial, not verified
+        # With section-aware git scanner: 4 resolved (remote, creds, AWS key, .env),
+        # 1 persistent (requirements.txt info). GPG signing was also fixed.
         self.assertEqual(verification["verification_status"], "partial")
-        self.assertEqual(verification["resolved"]["count"], 3)
+        self.assertEqual(verification["resolved"]["count"], 5)
         self.assertEqual(verification["persistent"]["count"], 1)
 
     def test_resolved_findings_are_exactly_the_fixed_ones(self):
@@ -62,7 +65,8 @@ class FixVerificationTests(unittest.TestCase):
         self._apply_fixes()
         verification = self.review.verify_fix(self.tmp, initial["findings"])
         resolved_descs = {f["description"] for f in verification["resolved"]["findings"]}
-        # The 3 resolved: insecure remote, AWS key, .env file
+        # The 4 resolved: insecure remote, credential store, AWS key, .env file
+        # (credential store is now detected by section-aware scanner)
         self.assertIn("Insecure remote URL protocol detected", resolved_descs)
         self.assertIn("Potential AWS Access Key ID detected", resolved_descs)
         # The .env finding description includes the suffix

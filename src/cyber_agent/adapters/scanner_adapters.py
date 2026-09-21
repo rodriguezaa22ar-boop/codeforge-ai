@@ -100,10 +100,25 @@ class GitConfigScanner(BaseScanner):
         except OSError as exc:
             raise ScannerError(f"unable to read git config: {exc}") from exc
 
-        # Insecure remote URL protocols
-        if "[remote" in content:
-            for line in content.splitlines():
-                if "url = http://" in line or "url = git://" in line:
+        # Parse git config into sections (real .git/config is INI-style)
+        sections: dict[str, dict[str, str]] = {}
+        current_section: str | None = None
+        for raw_line in content.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or line.startswith(";"):
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                current_section = line[1:-1]
+                sections[current_section] = {}
+            elif "=" in line and current_section is not None:
+                key, _, value = line.partition("=")
+                sections[current_section][key.strip()] = value.strip()
+
+        # Insecure remote URL protocols — check every [remote "..."] section
+        for section_name, keys in sections.items():
+            if section_name.startswith("remote") and "url" in keys:
+                url = keys["url"]
+                if url.startswith("http://") or url.startswith("git://"):
                     findings.append(Finding(
                         category="git_config",
                         severity="high",
@@ -112,32 +127,33 @@ class GitConfigScanner(BaseScanner):
                         recommendation="Use SSH or HTTPS URLs for remote repositories",
                     ))
                     categories.add("git_config")
-                    break
 
-        # Credential store (plaintext credentials)
-        if "credential.helper" in content:
-            for line in content.splitlines():
-                if "credential.helper" in line and "store" in line:
-                    findings.append(Finding(
-                        category="git_config",
-                        severity="medium",
-                        file=str(config_file.relative_to(repo_path)),
-                        description="Git credential store enabled — credentials stored in plaintext",
-                        recommendation="Use credential cache or a credential manager instead of store",
-                    ))
-                    categories.add("git_config")
-                    break
-
-        # GPG signing without signing key
-        if "commit.gpgsign" in content and "user.signingkey" not in content:
+        # Credential store — check [credential] section
+        cred_section = sections.get("credential", {})
+        if cred_section.get("helper", "").lower() == "store":
             findings.append(Finding(
                 category="git_config",
-                severity="low",
+                severity="medium",
                 file=str(config_file.relative_to(repo_path)),
-                description="GPG signing enabled but no signing key configured",
-                recommendation="Configure user.signingkey or disable commit.gpgsign if not needed",
+                description="Git credential store enabled — credentials stored in plaintext",
+                recommendation="Use credential cache or a credential manager instead of store",
             ))
             categories.add("git_config")
+
+        # GPG signing without signing key — check [commit] and [user] sections
+        commit_section = sections.get("commit", {})
+        if commit_section.get("gpgsign", "false").lower() == "true":
+            user_section = sections.get("user", {})
+            signing_key = user_section.get("signingkey", "")
+            if not signing_key:
+                findings.append(Finding(
+                    category="git_config",
+                    severity="low",
+                    file=str(config_file.relative_to(repo_path)),
+                    description="GPG signing enabled but no signing key configured",
+                    recommendation="Configure user.signingkey or disable commit.gpgsign if not needed",
+                ))
+                categories.add("git_config")
 
         return ScanResult(
             scanner_name=self.name,
