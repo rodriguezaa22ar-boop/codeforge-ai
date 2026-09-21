@@ -72,16 +72,20 @@ def _contract(
     input_schema: Mapping[str, Any],
     output_schema: Mapping[str, Any],
     handler: str,
+    *,
+    risk: RiskLevel = RiskLevel.READ_ONLY,
+    requires_approval: bool = False,
 ) -> CapabilityContract:
     return CapabilityContract(
         id=capability_id,
         version="0.1.0",
         purpose=purpose,
-        risk=RiskLevel.READ_ONLY,
+        risk=risk,
         input_schema=input_schema,
         output_schema=output_schema,
         transport=TransportSpec(kind=TransportKind.IN_PROCESS),
         handler=handler,
+        requires_approval=requires_approval,
     )
 
 
@@ -225,6 +229,8 @@ def default_contracts() -> tuple[CapabilityContract, ...]:
                 },
             },
             "repository_security_review",
+            risk=RiskLevel.GIT_PUBLISH,
+            requires_approval=True,
         ),
         _contract(
             "repository.fix_verification",
@@ -300,6 +306,8 @@ def default_contracts() -> tuple[CapabilityContract, ...]:
                 },
             },
             "repository_fix_verification",
+            risk=RiskLevel.GIT_PUBLISH,
+            requires_approval=True,
         ),
     )
 

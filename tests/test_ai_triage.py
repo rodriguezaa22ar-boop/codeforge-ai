@@ -120,7 +120,6 @@ class RiskLevelTests(unittest.TestCase):
     def test_high_only_secrets_is_critical(self):
         findings = [_finding("high", "secrets")]
         notes = _deterministic_triage(findings)
-        # action_now for high secrets → critical
         self.assertEqual(_compute_risk_level(findings, notes), "critical")
 
     def test_high_git_config_review_is_high(self):
