@@ -370,7 +370,8 @@ class RepositorySecurityReview:
         if not repo_path.is_dir():
             raise ScannerError(f"repository path does not exist: {repo_path}")
 
-        # Re-run scanners
+        # Re-run scanners (current scan may skip categories the original
+        # did not; findings from skipped categories are reported separately).
         current_review = self.review(
             repo_path=repo_path,
             include_git_config=include_git_config,
@@ -390,18 +391,37 @@ class RepositorySecurityReview:
         original_keys = {finding_key(f) for f in original_findings}
         current_keys = {finding_key(f) for f in current_findings}
 
-        resolved_keys = original_keys - current_keys
-        persistent_keys = original_keys & current_keys
-        new_keys = current_keys - original_keys
+        # Original findings whose category was not re-scanned count as unchecked,
+        # not resolved — the verifier did not look at that category.
+        unchecked_categories: set[str] = set()
+        if not include_git_config:
+            unchecked_categories.add("git_config")
+        if not include_secrets:
+            unchecked_categories.add("secrets")
+        if not include_dependencies:
+            unchecked_categories.add("dependencies")
+
+        unchecked_keys = {
+            key for key in original_keys if key[0] in unchecked_categories
+        }
+        checked_original_keys = original_keys - unchecked_keys
+        checked_current_keys = {
+            key for key in current_keys if key[0] not in unchecked_categories
+        }
+
+        resolved_keys = checked_original_keys - checked_current_keys
+        persistent_keys = checked_original_keys & checked_current_keys
+        new_keys = checked_current_keys - checked_original_keys
 
         resolved = [f for f in original_findings if finding_key(f) in resolved_keys]
         persistent = [f for f in original_findings if finding_key(f) in persistent_keys]
+        unchecked = [f for f in original_findings if finding_key(f) in unchecked_keys]
         new = [f for f in current_findings if finding_key(f) in new_keys]
 
         # Determine verification status
         if not original_findings:
-            status = "unverified"
-        elif not current_findings:
+            raise ScannerError("original_findings must be non-empty")
+        if not current_findings:
             status = "verified"
         elif not persistent_keys:
             status = "verified"
@@ -426,6 +446,10 @@ class RepositorySecurityReview:
             "persistent": {
                 "count": len(persistent),
                 "findings": persistent,
+            },
+            "unchecked": {
+                "count": len(unchecked),
+                "findings": unchecked,
             },
             "new": {
                 "count": len(new),
