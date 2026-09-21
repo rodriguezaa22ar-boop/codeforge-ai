@@ -189,7 +189,7 @@ class SecretsScanner(BaseScanner):
                     continue
 
                 for pattern, severity, description in self.SECRETS_PATTERNS:
-                    if pattern in content:
+                    if re.search(pattern, content):
                         findings.append(Finding(
                             category="secrets",
                             severity=severity,
@@ -198,7 +198,6 @@ class SecretsScanner(BaseScanner):
                             recommendation="Remove sensitive data from version control. Use environment variables or a secrets manager.",
                         ))
                         categories.add("secrets")
-                        break  # One finding per file
 
         return ScanResult(
             scanner_name=self.name,
