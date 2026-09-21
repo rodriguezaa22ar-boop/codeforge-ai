@@ -350,6 +350,92 @@ class RepositorySecurityReview:
             "timestamp": self._now(),
         }
 
+    def verify_fix(
+        self,
+        repo_path: Path,
+        original_findings: list[dict[str, Any]],
+        include_git_config: bool = True,
+        include_secrets: bool = True,
+        include_dependencies: bool = True,
+    ) -> dict[str, Any]:
+        """Re-scan a repository and compare against original findings to verify fixes.
+
+        Returns a verification report with:
+        - original: the original findings (as provided)
+        - current: findings from the current scan
+        - resolved: original findings no longer present
+        - persistent: original findings still present
+        - new: findings present now but not in the original set
+        - verification_status: overall status (verified | partial | unverified)
+        """
+        if not repo_path.is_dir():
+            raise ScannerError(f"repository path does not exist: {repo_path}")
+
+        # Re-run scanners
+        current_review = self.review(
+            repo_path=repo_path,
+            include_git_config=include_git_config,
+            include_secrets=include_secrets,
+            include_dependencies=include_dependencies,
+        )
+        current_findings = current_review["findings"]
+
+        # Build lookup keys for comparison: (category, file, description)
+        def finding_key(f: dict[str, Any]) -> tuple[str, str, str]:
+            return (
+                f.get("category", "unknown"),
+                f.get("file", "unknown"),
+                f.get("description", "").lower().strip(),
+            )
+
+        original_keys = {finding_key(f) for f in original_findings}
+        current_keys = {finding_key(f) for f in current_findings}
+
+        resolved_keys = original_keys - current_keys
+        persistent_keys = original_keys & current_keys
+        new_keys = current_keys - original_keys
+
+        resolved = [f for f in original_findings if finding_key(f) in resolved_keys]
+        persistent = [f for f in original_findings if finding_key(f) in persistent_keys]
+        new = [f for f in current_findings if finding_key(f) in new_keys]
+
+        # Determine verification status
+        if not original_findings:
+            status = "unverified"
+        elif not current_findings:
+            status = "verified"
+        elif not persistent_keys:
+            status = "verified"
+        elif not resolved_keys:
+            status = "unverified"
+        else:
+            status = "partial"
+
+        return {
+            "original": {
+                "total": len(original_findings),
+                "findings": original_findings,
+            },
+            "current": {
+                "total": len(current_findings),
+                "findings": current_findings,
+            },
+            "resolved": {
+                "count": len(resolved),
+                "findings": resolved,
+            },
+            "persistent": {
+                "count": len(persistent),
+                "findings": persistent,
+            },
+            "new": {
+                "count": len(new),
+                "findings": new,
+            },
+            "verification_status": status,
+            "timestamp": self._now(),
+        }
+
     @staticmethod
     def _now() -> str:
         from datetime import datetime, timezone

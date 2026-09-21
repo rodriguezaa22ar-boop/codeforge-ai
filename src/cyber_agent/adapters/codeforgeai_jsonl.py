@@ -226,6 +226,81 @@ def default_contracts() -> tuple[CapabilityContract, ...]:
             },
             "repository_security_review",
         ),
+        _contract(
+            "repository.fix_verification",
+            "Re-scan a repository and verify that previously identified security findings have been resolved",
+            {
+                "type": "object",
+                "required": ["repository_path", "original_findings"],
+                "properties": {
+                    "repository_path": {"type": "string", "minLength": 1},
+                    "original_findings": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "category": {"type": "string"},
+                                "severity": {"type": "string", "enum": ["info", "low", "medium", "high", "critical"]},
+                                "file": {"type": "string"},
+                                "description": {"type": "string"},
+                                "recommendation": {"type": "string"},
+                            },
+                        },
+                    },
+                    "include_git_config": {"type": "boolean", "default": True},
+                    "include_secrets": {"type": "boolean", "default": True},
+                    "include_dependencies": {"type": "boolean", "default": True},
+                },
+            },
+            {
+                "type": "object",
+                "required": ["original", "current", "resolved", "persistent", "new", "verification_status", "timestamp"],
+                "properties": {
+                    "original": {
+                        "type": "object",
+                        "properties": {
+                            "total": {"type": "integer"},
+                            "findings": {"type": "array", "items": {"type": "object"}},
+                        },
+                    },
+                    "current": {
+                        "type": "object",
+                        "properties": {
+                            "total": {"type": "integer"},
+                            "findings": {"type": "array", "items": {"type": "object"}},
+                        },
+                    },
+                    "resolved": {
+                        "type": "object",
+                        "properties": {
+                            "count": {"type": "integer"},
+                            "findings": {"type": "array", "items": {"type": "object"}},
+                        },
+                    },
+                    "persistent": {
+                        "type": "object",
+                        "properties": {
+                            "count": {"type": "integer"},
+                            "findings": {"type": "array", "items": {"type": "object"}},
+                        },
+                    },
+                    "new": {
+                        "type": "object",
+                        "properties": {
+                            "count": {"type": "integer"},
+                            "findings": {"type": "array", "items": {"type": "object"}},
+                        },
+                    },
+                    "verification_status": {
+                        "type": "string",
+                        "enum": ["verified", "partial", "unverified"],
+                    },
+                    "timestamp": {"type": "string"},
+                },
+            },
+            "repository_fix_verification",
+        ),
     )
 
 
@@ -370,6 +445,32 @@ class CodeForgeAIAdapter:
             include_dependencies=include_deps,
         )
 
+    def repository_fix_verification(self, inputs: Mapping[str, Any]) -> dict[str, Any]:
+        """Re-scan a repository and verify that previously identified findings are resolved.
+
+        Takes the original findings from a prior repository.security_review call
+        and compares them against a fresh scan. Returns a report with resolved,
+        persistent, and new findings, plus an overall verification status.
+        """
+        repo_path = Path(inputs["repository_path"]).expanduser().resolve()
+        original = inputs["original_findings"]
+        include_deps = inputs.get("include_dependencies", True)
+        include_secrets = inputs.get("include_secrets", True)
+        include_git_config = inputs.get("include_git_config", True)
+
+        if not repo_path.is_dir():
+            raise AdapterError(f"repository path does not exist: {repo_path}")
+        if not isinstance(original, list) or not original:
+            raise AdapterError("original_findings must be a non-empty list")
+
+        review = RepositorySecurityReview()
+        return review.verify_fix(
+            repo_path=repo_path,
+            original_findings=original,
+            include_git_config=include_git_config,
+            include_secrets=include_secrets,
+            include_dependencies=include_deps,
+        )
 
 
 class JsonlServer:
